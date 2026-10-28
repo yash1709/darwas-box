@@ -82,6 +82,56 @@ def load_panel(start, end=None, refresh=False):
     return idx, names, arr
 
 
+def nifty500_symbols():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty500.csv")
+    return pd.read_csv(path)["Symbol"].dropna().astype(str).str.strip().tolist()
+
+
+def load_scan_panel(refresh=False, period="2y", batch=50):
+    """Recent daily OHLC for the Nifty 500 (scanner only; the backtest stays on the Nifty 50)."""
+    cache = os.path.join(os.path.dirname(CACHE), "nifty500_recent.pkl")
+    if os.path.exists(cache) and not refresh:
+        with open(cache, "rb") as f:
+            raw = pickle.load(f)
+    else:
+        import yfinance as yf
+        syms = nifty500_symbols()
+        raw = {}
+        todo = syms
+        for size in (batch, 10, 1):                 # retry what Yahoo dropped, in smaller batches
+            for i in range(0, len(todo), size):
+                chunk = todo[i:i + size]
+                try:
+                    d = yf.download([s_ + ".NS" for s_ in chunk], period=period, auto_adjust=False,
+                                    group_by="ticker", threads=True, progress=False)
+                except Exception as e:
+                    print(f"batch {i} failed: {e}")
+                    continue
+                for s_ in chunk:
+                    try:
+                        x = d[s_ + ".NS"][["Open", "High", "Low", "Close"]].dropna()
+                        if len(x) > LOOKBACK + 10:
+                            raw[s_] = x
+                    except Exception:
+                        pass
+            todo = [s_ for s_ in syms if s_ not in raw]
+            if len(todo) < 0.03 * len(syms):
+                break
+        if len(raw) < 0.7 * len(syms):
+            raise RuntimeError(f"download incomplete: {len(raw)}/{len(syms)} stocks")
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        with open(cache, "wb") as f:
+            pickle.dump(raw, f)
+    idx = pd.DatetimeIndex(sorted(set().union(*[d.index for d in raw.values()])))
+    names = list(raw)
+    arr = {k: np.full((len(idx), len(names)), np.nan) for k in ["Open", "High", "Low", "Close"]}
+    for j, t in enumerate(names):
+        d = raw[t].reindex(idx)
+        for k in arr:
+            arr[k][:, j] = d[k].to_numpy()
+    return idx, names, arr
+
+
 def prepare(idx, arr):
     """Previous-week high per day, new-week flags, and scanner metrics (known at prior close)."""
     O, H, L, C = arr["Open"], arr["High"], arr["Low"], arr["Close"]
@@ -268,6 +318,7 @@ def current_signals(idx, names, arr, pre, p=P(), holdings=None):
     iso = idx.isocalendar()
     wid = (iso.year * 100 + iso.week).to_numpy()
     cur = wid == wid[-1]
+    prev_wk = wid == np.unique(wid)[-2] if len(np.unique(wid)) > 1 else cur
     per_buy = p.capital / p.max_stocks / p.max_lots
     lots_by = {}
     if holdings is not None and len(holdings):
@@ -282,12 +333,13 @@ def current_signals(idx, names, arr, pre, p=P(), holdings=None):
             continue
         cmp_ = C[last, j]
         win = C[last - LOOKBACK + 1:last + 1, j]
-        if np.isnan(win).any():
+        ph = pre["prev_high"][last, j] if pre is not None else (
+            np.nanmax(H[prev_wk, j]) if (~np.isnan(H[prev_wk, j])).any() else np.nan)
+        if np.isnan(win).sum() > 0.05 * LOOKBACK or np.isnan(ph):
             continue
-        hi, lo = win.argmax(), win.argmin()
+        hi, lo = np.nanargmax(win), np.nanargmin(win)
         drop = 1 - cmp_ / win[hi]
         is_boh = lo > hi
-        ph = pre["prev_high"][last, j]
         wk_hi = np.nanmax(H[cur, j])
         trig = ph + p.tick
         nxt = wk_hi + p.tick

@@ -24,6 +24,18 @@ def get_data(refresh_token: int):
     return idx, names, arr
 
 
+@st.cache_resource(ttl=6 * 3600, show_spinner="Loading Nifty 500 scanner data (can take ~1-2 min if stale)...")
+def get_scan(refresh_token: int):
+    idx, names, arr = dv.load_scan_panel()
+    expected = pd.Timestamp.today().normalize() - pd.offsets.BDay(1)
+    if refresh_token > 0 or idx[-1] < expected:
+        try:
+            idx, names, arr = dv.load_scan_panel(refresh=True)
+        except Exception as e:
+            st.session_state["refresh_error"] = str(e)
+    return idx, names, arr
+
+
 @st.cache_resource(show_spinner="Computing scanner metrics (one-off)...")
 def get_pre(refresh_token: int, data_key: str):
     idx, names, arr = get_data(refresh_token)
@@ -72,7 +84,13 @@ params = dv.P(capital=float(capital), max_stocks=max_stocks, max_lots=max_lots, 
 tab0, tab1, tab2 = st.tabs(["Signals / Scanner", "Backtest: FIFO vs LIFO", "Parameter sweep"])
 
 with tab0:
-    st.subheader(f"Signals as of {idx[-1].date()} close")
+    universe = st.radio("Scanner universe", ["Nifty 500", "Nifty 50"], horizontal=True)
+    if universe == "Nifty 500":
+        s_idx, s_names, s_arr = get_scan(token)
+        s_pre = None
+    else:
+        s_idx, s_names, s_arr, s_pre = idx, names, arr, pre
+    st.subheader(f"Signals as of {s_idx[-1].date()} close - {universe} ({len(s_names)} stocks)")
     st.caption("GTT buy = last completed week's high + Rs 0.05. Candidates = stocks you don't hold, 52w-low more recent "
                "than 52w-high (BOH eligible), ranked by biggest fall from the 52w-high close. "
                "Prices come from Yahoo Finance and can lag; verify with your broker before placing orders.")
@@ -87,9 +105,9 @@ with tab0:
         st.session_state.holdings = pd.DataFrame({"Ticker": pd.Series(dtype=str), "Date": pd.Series(dtype=str),
                                                   "BuyPrice": pd.Series(dtype=float), "Qty": pd.Series(dtype=float)})
     hold = st.data_editor(st.session_state.holdings, num_rows="dynamic", width="stretch",
-                          column_config={"Ticker": st.column_config.SelectboxColumn(options=names)})
+                          column_config={"Ticker": st.column_config.SelectboxColumn(options=s_names)})
     st.download_button("Download holdings (CSV)", hold.to_csv(index=False), "holdings.csv")
-    sig = dv.current_signals(idx, names, arr, pre, params, hold)
+    sig = dv.current_signals(s_idx, s_names, s_arr, s_pre, params, hold)
 
     held = sig[sig.Held]
     cand = sig[~sig.Held & sig.BOH]
@@ -116,7 +134,7 @@ with tab0:
             st.caption("Trailing mode: once the target is hit, hold and sell when the day's low goes below yesterday's low "
                        "(see BelowYestLow).")
 
-    with st.expander("Full scanner (all Nifty 50 stocks)"):
+    with st.expander(f"Full scanner (all {universe} stocks)", expanded=True):
         st.dataframe(sig, width="stretch", hide_index=True)
 
 
