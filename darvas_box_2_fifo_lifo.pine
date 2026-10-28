@@ -1,0 +1,119 @@
+//@version=5
+strategy("Darvas Box 2.0 - FIFO/LIFO", overlay=true, pyramiding=10,
+     initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.05, calc_on_order_fills=false)
+
+// ---------------- Inputs ----------------
+grpF = "Trend filter"
+nearHighPct = input.float(10.0, "Max distance below 52w high (%)", minval=0, group=grpF)
+highLen     = input.int(252, "High lookback (bars)", minval=20, group=grpF)
+fastLen     = input.int(20, "Fast SMA", minval=2, group=grpF)
+slowLen     = input.int(50, "Slow SMA", minval=2, group=grpF)
+
+grpB = "Box"
+confirmBars = input.int(3, "Bars to confirm box", minval=1, group=grpB)
+useVol      = input.bool(true, "Require volume > SMA on breakout", group=grpB)
+volLen      = input.int(20, "Volume SMA", minval=2, group=grpB)
+
+grpR = "Risk / pyramiding"
+riskPct  = input.float(1.0, "Risk per lot (% equity)", minval=0.1, step=0.1, group=grpR)
+maxLots  = input.int(4, "Max lots", minval=1, maxval=10, group=grpR)
+trailAll = input.bool(true, "Trail all lot stops to newest box floor", group=grpR)
+
+grpX = "Exit ordering"
+exitMode  = input.string("LIFO", "Partial exit order", options=["FIFO", "LIFO"], group=grpX)
+partialOn = input.bool(true, "Peel one lot when close < fast SMA", group=grpX)
+
+// ---------------- Indicators ----------------
+smaF = ta.sma(close, fastLen)
+smaS = ta.sma(close, slowLen)
+hh   = ta.highest(high, highLen)
+volOk = not useVol or volume > ta.sma(volume, volLen)
+trendOk = close >= hh * (1 - nearHighPct / 100) and close > smaF and close > smaS
+
+// ---------------- Darvas box ----------------
+var float candTop = na
+var float candBot = na
+var int   cnt     = 0
+var float boxTop  = na
+var float boxBot  = na
+var bool  boxLive = false
+
+if na(candTop) or high > candTop
+    candTop := high
+    candBot := na
+    cnt := 0
+else
+    cnt += 1
+    candBot := na(candBot) ? low : math.min(candBot, low)
+    if cnt == confirmBars
+        boxTop := candTop
+        boxBot := candBot
+        boxLive := true
+
+// box broken to the downside -> discard
+if boxLive and close < boxBot
+    boxLive := false
+
+breakout = boxLive and close > boxTop
+
+// ---------------- Lot bookkeeping ----------------
+var array<string> lotIds   = array.new_string()
+var array<float>  lotStops = array.new_float()
+var array<int>    lotBars  = array.new_int()
+var float lastEntry = na
+
+nOpen = strategy.opentrades
+if nOpen == 0 and lotIds.size() == 0
+    lastEntry := na
+
+// ---------------- Entries ----------------
+canAdd = nOpen + (lotIds.size() > nOpen ? lotIds.size() - nOpen : 0) < maxLots
+aboveLast = na(lastEntry) or boxTop > lastEntry
+
+if breakout and trendOk and volOk and canAdd and aboveLast and boxBot < close
+    string id = "L" + str.tostring(bar_index)
+    qty = (strategy.equity * riskPct / 100) / (close - boxBot)
+    strategy.entry(id, strategy.long, qty=qty)
+    lotIds.push(id)
+    lotStops.push(boxBot)
+    lotBars.push(bar_index)
+    lastEntry := close
+    if trailAll
+        for i = 0 to lotStops.size() - 1
+            lotStops.set(i, math.max(lotStops.get(i), boxBot))
+    boxLive := false
+
+// ---------------- Prune lots that have closed ----------------
+if lotIds.size() > 0
+    for j = lotIds.size() - 1 to 0
+        found = false
+        if nOpen > 0
+            for k = 0 to nOpen - 1
+                if strategy.opentrades.entry_id(k) == lotIds.get(j)
+                    found := true
+        if not found and bar_index > lotBars.get(j) + 1
+            lotIds.remove(j)
+            lotStops.remove(j)
+            lotBars.remove(j)
+
+// ---------------- Stops ----------------
+if nOpen > 0
+    for k = 0 to nOpen - 1
+        id = strategy.opentrades.entry_id(k)
+        idx = lotIds.indexof(id)
+        if idx >= 0
+            strategy.exit("X-" + id, from_entry=id, stop=lotStops.get(idx))
+
+// ---------------- Trend exits ----------------
+if nOpen > 0 and close < smaS
+    strategy.close_all(comment="Close < SMA" + str.tostring(slowLen))
+else if partialOn and nOpen > 1 and close < smaF
+    pick = exitMode == "FIFO" ? 0 : nOpen - 1
+    strategy.close(strategy.opentrades.entry_id(pick), comment=exitMode + " peel")
+
+// ---------------- Plots ----------------
+plot(boxLive ? boxTop : na, "Box top", color.new(color.green, 0), 2, plot.style_linebr)
+plot(boxLive ? boxBot : na, "Box floor", color.new(color.red, 0), 2, plot.style_linebr)
+plot(smaF, "Fast SMA", color.new(color.orange, 30))
+plot(smaS, "Slow SMA", color.new(color.blue, 30))

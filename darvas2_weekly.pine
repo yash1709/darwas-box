@@ -1,0 +1,128 @@
+//@version=5
+// Advanced Darvas Box 2.0 (Fire in India) - single-symbol weekly Darvas with FIFO / LIFO exits.
+// Put it on a DAILY chart of an NSE stock (e.g. NSE:RELIANCE).
+//
+// Rules (from the video):
+//  * Buy trigger = previous week's high + 0.05; one buy per week.
+//  * Skip the buy if the trigger is within +/-2.75% of the LAST buy price (ignorable range).
+//  * Buy size = capital / max stocks / max lots (capital compounds with realised profit).
+//  * FIFO: sell everything when the AVERAGE price reaches +target.
+//    LIFO: sell each lot when it reaches +target on ITS OWN buy price.
+//  * Optional trailing profit: once the target is reached, hold; sell when price trades below
+//    the previous day's low.
+// The multi-stock scanner (52w-high drop / BOH ranking, max stocks held) is not replicated here;
+// 'Max stocks' only sets the per-buy allocation. Use darvas2_india.py for the portfolio version.
+
+strategy("Darvas Box 2.0 Weekly - FIFO/LIFO", overlay=true, pyramiding=20,
+     initial_capital=200000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.percent, commission_value=0.05,
+     calc_on_order_fills=false, process_orders_on_close=false)
+
+// ---------------- Inputs ----------------
+mode      = input.string("FIFO", "Exit mode", options=["FIFO", "LIFO"])
+targetPct = input.float(5.0, "Target %", minval=0.5, step=0.25)
+ignorePct = input.float(2.75, "Ignorable range %", minval=0, step=0.25)
+tick      = input.float(0.05, "Buy above last week's high by", minval=0, step=0.05)
+maxLots   = input.int(6, "Max lots (parts per stock)", minval=1, maxval=20)
+maxStocks = input.int(4, "Max stocks (allocation divisor)", minval=1)
+incentive = input.float(0.0, "Incentive % (profit not compounded)", minval=0, maxval=100)
+trail     = input.bool(false, "Trailing profit exit (sell if low < yesterday's low after target)")
+
+// ---------------- Week tracking (no look-ahead) ----------------
+newWeek = ta.change(time("W")) != 0
+var float wkHigh = na
+var float prevWH = na
+if newWeek
+    prevWH := wkHigh          // high of the week that just finished
+    wkHigh := high
+else
+    wkHigh := math.max(nz(wkHigh, high), high)
+// is this the last bar of its week? (so the next bar starts a new week)
+lastOfWeek = time_close("W") <= time_close
+
+// ---------------- Fill detection ----------------
+var float lastBuy = na          // trigger price of the most recent filled buy
+var float pendTrig = na
+var bool  boughtThisWeek = false
+var string pendId = ""
+var int   prevOpen = 0
+
+nOpen = strategy.opentrades
+if newWeek
+    boughtThisWeek := false
+filled = nOpen > prevOpen
+if filled
+    boughtThisWeek := true
+    lastBuy := pendTrig
+if nOpen == 0
+    lastBuy := na
+prevOpen := nOpen
+
+// ---------------- Lot bookkeeping (armed flags for trailing) ----------------
+var array<string> lotIds   = array.new_string()
+var array<bool>   lotArmed = array.new_bool()
+
+if nOpen > 0
+    for i = 0 to nOpen - 1
+        id = strategy.opentrades.entry_id(i)
+        if lotIds.indexof(id) < 0
+            lotIds.push(id)
+            lotArmed.push(false)
+if lotIds.size() > 0
+    for j = lotIds.size() - 1 to 0
+        gone = true
+        if nOpen > 0
+            for i = 0 to nOpen - 1
+                if strategy.opentrades.entry_id(i) == lotIds.get(j)
+                    gone := false
+        if gone
+            lotIds.remove(j)
+            lotArmed.remove(j)
+if filled and mode == "FIFO" and lotArmed.size() > 0
+    for j = 0 to lotArmed.size() - 1
+        lotArmed.set(j, false)   // average changed -> re-arm
+
+// ---------------- Next-bar buy order ----------------
+// trigger for the NEXT bar: if this is the last bar of the week, next week's reference is this week's high
+refHigh   = lastOfWeek ? wkHigh : prevWH
+boughtNxt = lastOfWeek ? false : boughtThisWeek
+trig      = refHigh + tick
+base      = strategy.initial_capital + strategy.netprofit * (1 - incentive / 100)
+qty       = math.floor(base / maxStocks / maxLots / trig)
+inRange   = not na(lastBuy) and trig >= lastBuy * (1 - ignorePct / 100) and trig <= lastBuy * (1 + ignorePct / 100)
+
+if pendId != ""
+    strategy.cancel(pendId)
+canBuy = not na(trig) and not boughtNxt and nOpen < maxLots and not inRange and qty >= 1
+if canBuy
+    pendId := "B" + str.tostring(bar_index)
+    pendTrig := trig
+    strategy.entry(pendId, strategy.long, qty=qty, stop=trig)
+else
+    pendId := ""
+
+// ---------------- Exits ----------------
+if nOpen > 0
+    // FIFO target = average price of the whole position
+    fifoTgt = strategy.position_avg_price * (1 + targetPct / 100)
+    for i = 0 to nOpen - 1
+        id = strategy.opentrades.entry_id(i)
+        idx = lotIds.indexof(id)
+        tgt = mode == "FIFO" ? fifoTgt : strategy.opentrades.entry_price(i) * (1 + targetPct / 100)
+        armed = idx >= 0 ? lotArmed.get(idx) : false
+        if trail
+            if armed
+                strategy.exit("X-" + id, from_entry=id, stop=low)     // low of today = "yesterday's low" tomorrow
+            else
+                if high >= tgt and idx >= 0
+                    lotArmed.set(idx, true)                           // target touched: hold, trail from here
+                    strategy.exit("X-" + id, from_entry=id, stop=low)
+        else
+            strategy.exit("X-" + id, from_entry=id, limit=tgt)
+
+// ---------------- Plots ----------------
+plot(prevWH, "Prev week high", color.new(color.gray, 40), 1, plot.style_stepline)
+plot(canBuy ? trig : na, "Buy trigger", color.new(color.green, 0), 2, plot.style_linebr)
+plot(strategy.position_size > 0 ? strategy.position_avg_price : na, "Avg price", color.new(color.orange, 0), 1)
+plot(not na(lastBuy) ? lastBuy * (1 + ignorePct / 100) : na, "Ignore hi", color.new(color.red, 60), 1, plot.style_linebr)
+plot(not na(lastBuy) ? lastBuy * (1 - ignorePct / 100) : na, "Ignore lo", color.new(color.red, 60), 1, plot.style_linebr)
