@@ -12,22 +12,28 @@ import darvas2_india as dv
 st.set_page_config(page_title="Darvas Box 2.0 - Nifty 50", layout="wide")
 
 
-@st.cache_resource(show_spinner="Loading Nifty 50 data...")
+@st.cache_resource(ttl=6 * 3600, show_spinner="Loading Nifty 50 data (downloads latest prices if stale)...")
 def get_data(refresh_token: int):
-    idx, names, arr = dv.load_panel("2014-01-01", refresh=refresh_token > 0)
+    idx, names, arr = dv.load_panel("2014-01-01")
+    expected = pd.Timestamp.today().normalize() - pd.offsets.BDay(1)
+    if refresh_token > 0 or idx[-1] < expected:
+        try:
+            idx, names, arr = dv.load_panel("2014-01-01", refresh=True)
+        except Exception as e:      # Yahoo down / rate-limited: keep the bundled cache
+            st.session_state["refresh_error"] = str(e)
     return idx, names, arr
 
 
 @st.cache_resource(show_spinner="Computing scanner metrics (one-off)...")
-def get_pre(refresh_token: int):
+def get_pre(refresh_token: int, data_key: str):
     idx, names, arr = get_data(refresh_token)
     return dv.prepare(idx, arr)
 
 
 @st.cache_data(show_spinner=False)
-def run_one(token, mode, params):
+def run_one(token, data_key, mode, params):
     idx, names, arr = get_data(token)
-    r, tr = dv.simulate(idx, names, arr, get_pre(token), mode, params)
+    r, tr = dv.simulate(idx, names, arr, get_pre(token, data_key), mode, params)
     return r, tr, tr.attrs["equity"]
 
 
@@ -55,14 +61,67 @@ with st.sidebar:
 
 token = st.session_state.token
 idx, names, arr = get_data(token)
+data_key = str(idx[-1].date())
+pre = get_pre(token, data_key)
+if "refresh_error" in st.session_state:
+    st.sidebar.warning(f"Could not refresh prices, using bundled data: {st.session_state['refresh_error']}")
 st.sidebar.caption(f"{len(names)} stocks | {idx[0].date()} -> {idx[-1].date()}")
 params = dv.P(capital=float(capital), max_stocks=max_stocks, max_lots=max_lots, target=target,
               ignore=ignore, incentive=incentive, cost=cost, trail=trail)
 
-tab1, tab2 = st.tabs(["Backtest: FIFO vs LIFO", "Parameter sweep"])
+tab0, tab1, tab2 = st.tabs(["Signals / Scanner", "Backtest: FIFO vs LIFO", "Parameter sweep"])
+
+with tab0:
+    st.subheader(f"Signals as of {idx[-1].date()} close")
+    st.caption("GTT buy = last completed week's high + Rs 0.05. Candidates = stocks you don't hold, 52w-low more recent "
+               "than 52w-high (BOH eligible), ranked by biggest fall from the 52w-high close. "
+               "Prices come from Yahoo Finance and can lag; verify with your broker before placing orders.")
+    st.markdown("**Your current holdings** (one row per lot; edit, paste or upload a CSV with "
+                "`Ticker, Date, BuyPrice, Qty`). Needed for the ignore-range check and sell signals. "
+                "Not saved between sessions - download it to keep it.")
+    up = st.file_uploader("Upload holdings CSV", type="csv")
+    if up is not None and st.session_state.get("hold_file") != up.name:
+        st.session_state.holdings = pd.read_csv(up)
+        st.session_state.hold_file = up.name
+    if "holdings" not in st.session_state:
+        st.session_state.holdings = pd.DataFrame({"Ticker": pd.Series(dtype=str), "Date": pd.Series(dtype=str),
+                                                  "BuyPrice": pd.Series(dtype=float), "Qty": pd.Series(dtype=float)})
+    hold = st.data_editor(st.session_state.holdings, num_rows="dynamic", width="stretch",
+                          column_config={"Ticker": st.column_config.SelectboxColumn(options=names)})
+    st.download_button("Download holdings (CSV)", hold.to_csv(index=False), "holdings.csv")
+    sig = dv.current_signals(idx, names, arr, pre, params, hold)
+
+    held = sig[sig.Held]
+    cand = sig[~sig.Held & sig.BOH]
+    st.markdown(f"**Per-buy amount:** Rs {params.capital / params.max_stocks / params.max_lots:,.0f}  |  "
+                f"**Stocks held:** {len(held)}/{params.max_stocks}")
+
+    st.markdown("#### 1. Place / update GTT buy orders")
+    todo = sig[sig.Action.str.startswith(("CREATE", "UPDATE"))]
+    show = ["Rank", "Ticker", "Action", "CMP", "GTT_buy", "GTT_vs_CMP", "Qty", "Amount", "Drop52w",
+            "NextWeek_GTT", "TriggeredThisWeek"]
+    if todo.empty:
+        st.info("No buy GTTs to place right now.")
+    else:
+        st.dataframe(todo[show], width="stretch", hide_index=True)
+
+    st.markdown("#### 2. Sell signals on holdings")
+    if held.empty:
+        st.info("Enter your holdings above to see sell targets and averaging status.")
+    else:
+        cols = ["Ticker", "Lots", "AvgPrice", "CMP", "PnLPct", "FIFO_Target", "LIFO_NextTarget", "SellSignal",
+                "BelowYestLow", "YestLow", "LastBuy", "IgnoreLo", "IgnoreHi", "GTT_buy", "Action"]
+        st.dataframe(held[cols], width="stretch", hide_index=True)
+        if params.trail:
+            st.caption("Trailing mode: once the target is hit, hold and sell when the day's low goes below yesterday's low "
+                       "(see BelowYestLow).")
+
+    with st.expander("Full scanner (all Nifty 50 stocks)"):
+        st.dataframe(sig, width="stretch", hide_index=True)
+
 
 with tab1:
-    res = {m: run_one(token, m, params) for m in ("FIFO", "LIFO")}
+    res = {m: run_one(token, data_key, m, params) for m in ("FIFO", "LIFO")}
     summary = pd.DataFrame([r for r, _, _ in res.values()]).set_index("Mode")
     c = st.columns(4)
     for k, m in enumerate(("FIFO", "LIFO")):
@@ -90,7 +149,7 @@ with tab2:
         combos = list(product(lots, stocks, ("FIFO", "LIFO")))
         bar, rows = st.progress(0.0), []
         for i, (ml, ms, m) in enumerate(combos):
-            r, _, _ = run_one(token, m, replace(params, max_lots=ml, max_stocks=ms))
+            r, _, _ = run_one(token, data_key, m, replace(params, max_lots=ml, max_stocks=ms))
             rows.append(dict(MaxLots=ml, MaxStocks=ms, **r))
             bar.progress((i + 1) / len(combos))
         st.session_state.sweep = pd.DataFrame(rows)

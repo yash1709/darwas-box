@@ -66,6 +66,8 @@ def load_panel(start, end=None, refresh=False):
                     raw[t] = d
             except Exception as e:
                 print(f"skip {t}: {e}")
+        if len(raw) < 0.8 * len(NIFTY50):       # don't overwrite a good cache with a partial download
+            raise RuntimeError(f"download incomplete: {len(raw)}/{len(NIFTY50)} stocks")
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
         with open(CACHE, "wb") as f:
             pickle.dump(raw, f)
@@ -250,6 +252,100 @@ def simulate(idx, names, arr, pre, mode, p=P()):
                 ProfitFactor=gp / gl if gl > 0 else np.nan, AvgDays=tr.days.mean() if len(tr) else np.nan,
                 NetProfit=realised, MaxDeployed=deployed.max(), StuckCost=open_cost,
                 StuckMTM=end_mtm - open_cost, EndEquity=eq.iloc[-1]), tr
+
+
+# ---------------------------------------------------------------- live signals
+def current_signals(idx, names, arr, pre, p=P(), holdings=None):
+    """Scanner + GTT sheet for the latest bar, like the video's Scanner / Current Holdings sheets.
+
+    holdings: DataFrame with columns Ticker, Date, BuyPrice, Qty (one row per lot) or None.
+    Returns one row per stock. 'GTT buy' is last COMPLETED week's high + tick; 'Next-week GTT' uses
+    this week's high so far (final only after the week's last session).
+    """
+    H, L, C = arr["High"], arr["Low"], arr["Close"]
+    T = len(idx)
+    last = T - 1
+    iso = idx.isocalendar()
+    wid = (iso.year * 100 + iso.week).to_numpy()
+    cur = wid == wid[-1]
+    per_buy = p.capital / p.max_stocks / p.max_lots
+    lots_by = {}
+    if holdings is not None and len(holdings):
+        h = holdings.dropna(subset=["Ticker", "BuyPrice", "Qty"]).copy()
+        h["Date"] = pd.to_datetime(h["Date"], errors="coerce")
+        for t, g in h.sort_values("Date").groupby("Ticker"):
+            lots_by[t] = g
+    n_held = len(lots_by)
+    rows = []
+    for j, t in enumerate(names):
+        if np.isnan(C[last, j]):
+            continue
+        cmp_ = C[last, j]
+        win = C[last - LOOKBACK + 1:last + 1, j]
+        if np.isnan(win).any():
+            continue
+        hi, lo = win.argmax(), win.argmin()
+        drop = 1 - cmp_ / win[hi]
+        is_boh = lo > hi
+        ph = pre["prev_high"][last, j]
+        wk_hi = np.nanmax(H[cur, j])
+        trig = ph + p.tick
+        nxt = wk_hi + p.tick
+        triggered = wk_hi >= trig
+        row = dict(Ticker=t, CMP=cmp_, Drop52w=drop, BOH=is_boh,
+                   High52w=win[hi], Low52w=win[lo],
+                   GTT_buy=trig, GTT_vs_CMP=trig / cmp_ - 1, NextWeek_GTT=nxt,
+                   WeekHighSoFar=wk_hi, TriggeredThisWeek=triggered,
+                   Qty=int(per_buy // trig), Amount=int(per_buy // trig) * trig)
+        g = lots_by.get(t)
+        if g is None:
+            row.update(Held=False, Lots=0)
+            if not is_boh:
+                action = "Skip - not BOH eligible"
+            elif n_held >= p.max_stocks:
+                action = "Skip - max stocks already held"
+            elif triggered:
+                action = "Triggered this week - wait for next week"
+            else:
+                action = "CREATE GTT buy"
+        else:
+            qty = g.Qty.to_numpy(float)
+            px = g.BuyPrice.to_numpy(float)
+            avg = (qty * px).sum() / qty.sum()
+            last_buy = px[-1]
+            in_rng = last_buy * (1 - p.ignore) <= trig <= last_buy * (1 + p.ignore)
+            tgts = px * (1 + p.target)
+            fifo_t = avg * (1 + p.target)
+            row.update(Held=True, Lots=len(g), AvgPrice=avg, PnLPct=cmp_ / avg - 1,
+                       LastBuy=last_buy, IgnoreLo=last_buy * (1 - p.ignore), IgnoreHi=last_buy * (1 + p.ignore),
+                       FIFO_Target=fifo_t, LIFO_LotsAtTarget=int((H[last, j] >= tgts).sum()),
+                       LIFO_NextTarget=tgts.min(),
+                       YestLow=L[last - 1, j], TodayLow=L[last, j],
+                       BelowYestLow=bool(L[last, j] < L[last - 1, j]))
+            if in_rng:
+                action = "No GTT - inside ignore range"
+            elif len(g) >= p.max_lots:
+                action = "No GTT - max lots reached"
+            elif triggered:
+                action = "Triggered this week - skip"
+            else:
+                action = "UPDATE/CREATE averaging GTT"
+            sells = []
+            if H[last, j] >= fifo_t:
+                sells.append("FIFO: SELL ALL (avg target hit)")
+            if (H[last, j] >= tgts).any():
+                sells.append(f"LIFO: SELL {int((H[last, j] >= tgts).sum())} lot(s)")
+            row["SellSignal"] = " | ".join(sells)
+        row["Action"] = action
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    df["Rank"] = np.nan
+    cand = df[(~df.Held) & df.BOH].sort_values("Drop52w", ascending=False).index
+    df.loc[cand, "Rank"] = range(1, len(cand) + 1)
+    free = max(p.max_stocks - n_held, 0)
+    backup = (df.Action == "CREATE GTT buy") & (df.Rank > free)
+    df.loc[backup, "Action"] = "Backup candidate (only if a slot frees up)"
+    return df.sort_values(["Held", "Rank"], ascending=[False, True]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------- main
